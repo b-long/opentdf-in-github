@@ -12,8 +12,8 @@ cd "$REPO_ROOT"
 # Parse command line arguments
 AUTO_RESTART=false
 STOP_ONLY=false
-for arg in "$@"; do
-  case $arg in
+while [[ $# -gt 0 ]]; do
+  case "$1" in
     --auto-restart)
       AUTO_RESTART=true
       shift
@@ -23,7 +23,7 @@ for arg in "$@"; do
       shift
       ;;
     *)
-      echo "Unknown option: $arg"
+      echo "Unknown option: $1"
       echo "Usage: $0 [--auto-restart|--stop]"
       exit 1
       ;;
