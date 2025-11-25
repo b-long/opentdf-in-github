@@ -33,11 +33,10 @@ done
 echo "=== OpenTDF Platform Setup Script ==="
 echo ""
 
-# Determine temp directory (macOS and Linux compatible)
 TEMP_DIR="${TMPDIR:-/tmp}"
-
 PID_FILE="${TEMP_DIR}/opentdf_platform.pid"
 LOG_FILE="${TEMP_DIR}/opentdf_platform.log"
+PLATFORM_PORT=8080
 
 # Function to detect container runtime and compose command
 # Sets global variables: CONTAINER_RUNTIME and COMPOSE_CMD
@@ -56,7 +55,8 @@ detect_container_runtime() {
     elif command -v docker-compose &> /dev/null; then
       COMPOSE_CMD="docker-compose"
     else
-      COMPOSE_CMD="docker compose"
+      [ -z "$quiet" ] && echo "  ✗ No Docker Compose command found (tried 'docker compose' and 'docker-compose')."
+      return 1
     fi
     [ -z "$quiet" ] && echo "  ✓ Docker detected"
     [ -z "$quiet" ] && echo "  ✓ Using: $COMPOSE_CMD"
@@ -68,7 +68,8 @@ detect_container_runtime() {
     elif command -v podman-compose &> /dev/null; then
       COMPOSE_CMD="podman-compose"
     else
-      COMPOSE_CMD="podman compose"
+      [ -z "$quiet" ] && echo "  ✗ No Podman Compose command found (tried 'podman compose' and 'podman-compose')."
+      return 1
     fi
     [ -z "$quiet" ] && echo "  ✓ Podman detected"
     [ -z "$quiet" ] && echo "  ✓ Using: $COMPOSE_CMD"
@@ -77,6 +78,65 @@ detect_container_runtime() {
     [ -z "$quiet" ] && echo ""
     [ -z "$quiet" ] && echo "ERROR: No container runtime found. Please install Docker or Podman."
     return 1
+  fi
+}
+
+# Function to kill process bound to a specific port
+# Works on macOS (lsof) and Linux
+kill_port() {
+  local port=$1
+  local force=${2:-true}
+  
+  if ! command -v lsof &> /dev/null; then
+    echo "  Warning: lsof not found, cannot check port $port"
+    return 1
+  fi
+  
+  local pids=$(lsof -ti :$port 2>/dev/null || true)
+  
+  if [ -z "$pids" ]; then
+    return 0
+  fi
+  
+  echo "  Found process(es) bound to port $port (PIDs: $pids)"
+  
+  if [ "$force" = true ]; then
+    # Force kill
+    echo -n "  Force killing process(es)... "
+    for pid in $pids; do
+      kill -9 "$pid" 2>/dev/null || true
+    done
+    
+    # Verify port is free with retries
+    local verify_retries=5
+    while [ $verify_retries -gt 0 ]; do
+      sleep 1
+      if ! lsof -ti :$port &> /dev/null; then
+        echo "✓"
+        return 0
+      fi
+      verify_retries=$((verify_retries - 1))
+    done
+    
+    echo "✗ (failed - port still in use after kill)"
+    return 1
+  else
+    # Graceful kill
+    echo -n "  Killing process(es)... "
+    for pid in $pids; do
+      kill "$pid" 2>/dev/null || true
+    done
+    sleep 2
+    # Check if port is still in use
+    if lsof -ti :$port &> /dev/null; then
+      # Port still in use, try force kill
+      echo "(grace period expired, force killing)"
+      kill_port "$port" true
+      return $?
+    else
+      echo "✓"
+      return 0
+    fi
   fi
 }
 
@@ -94,42 +154,46 @@ recreate_ca_jks() {
   fi
 
   # Use the appropriate container runtime and volume mount flags
+  local runtime_cmd="$CONTAINER_RUNTIME"
+  local volume_flag
   if [ "$CONTAINER_RUNTIME" = "podman" ]; then
-    podman run --rm \
-      "$JAVA_ENV_OPTS" \
-      -v "$(cd "$keys_dir" && pwd):/keys:Z" \
-      --entrypoint keytool \
-      keycloak/keycloak:25.0 \
-      -importkeystore \
-      -srckeystore /keys/ca.p12 \
-      -srcstoretype PKCS12 \
-      -destkeystore /keys/ca.jks \
-      -deststoretype JKS \
-      -srcstorepass "${KEYSTORE_PASSWORD:-password}" \
-      -deststorepass "${KEYSTORE_PASSWORD:-password}" \
-      -noprompt
-  else
-    docker run --rm \
-      "$JAVA_ENV_OPTS" \
-      -v "$(cd "$keys_dir" && pwd):/keys" \
-      --entrypoint keytool \
-      keycloak/keycloak:25.0 \
-      -importkeystore \
-      -srckeystore /keys/ca.p12 \
-      -srcstoretype PKCS12 \
-      -destkeystore /keys/ca.jks \
-      -deststoretype JKS \
-      -srcstorepass "${KEYSTORE_PASSWORD:-password}" \
-      -deststorepass "${KEYSTORE_PASSWORD:-password}" \
-      -noprompt
+    volume_flag=":Z"
   fi
+  "$runtime_cmd" run --rm \
+    "$JAVA_ENV_OPTS" \
+    -v "$(cd "$keys_dir" && pwd):/keys${volume_flag}" \
+    --entrypoint keytool \
+    keycloak/keycloak:25.0 \
+    -importkeystore \
+    -srckeystore /keys/ca.p12 \
+    -srcstoretype PKCS12 \
+    -destkeystore /keys/ca.jks \
+    -deststoretype JKS \
+    -srcstorepass "${KEYSTORE_PASSWORD:-password}" \
+    -deststorepass "${KEYSTORE_PASSWORD:-password}" \
+    -noprompt
   
   echo "  ✓ ca.jks created successfully"
+}
+
+# Function to verify ca.jks is a file and fix if it's a directory
+verify_and_fix_ca_jks() {
+  local keys_dir="${1:-keys}"
+
+  if [ -d "$keys_dir/ca.jks" ]; then
+    echo "  Warning: ca.jks was created as a directory, removing and recreating..."
+    rm -rf "$keys_dir/ca.jks"
+    recreate_ca_jks "$keys_dir"
+  fi
 }
 
 # Handle --stop flag
 if [ "$STOP_ONLY" = true ]; then
   echo "Stopping OpenTDF platform..."
+
+  # Kill any processes bound to port 8080
+  echo "Checking for processes bound to port $PLATFORM_PORT..."
+  kill_port $PLATFORM_PORT
 
   # Stop the platform service if running
   if [ -f "$PID_FILE" ]; then
@@ -159,19 +223,18 @@ if [ "$STOP_ONLY" = true ]; then
 
   # Stop containers
   if [ -d platform ]; then
-    cd platform
-    echo "  Stopping and removing containers..."
-
-    # Detect container runtime and compose command (quiet mode)
-    detect_container_runtime "quiet"
-
-    if [ -n "$COMPOSE_CMD" ]; then
-      $COMPOSE_CMD down -v 2>/dev/null || true
-      echo "  ✓ Containers stopped and removed"
-    else
-      echo "  Warning: No container runtime found (docker/podman)"
-    fi
-    cd ..
+    (
+      cd platform
+      echo "  Stopping and removing containers..."
+      # Detect container runtime and compose command (quiet mode)
+      detect_container_runtime "quiet"
+      if [ -n "$COMPOSE_CMD" ]; then
+        $COMPOSE_CMD down -v 2>/dev/null || true
+        echo "  ✓ Containers stopped and removed"
+      else
+        echo "  Warning: No container runtime found (docker/podman)"
+      fi
+    )
   else
     echo "  Platform directory not found, skipping container cleanup"
   fi
@@ -219,7 +282,7 @@ echo ""
 # Detect yq version and set appropriate flags
 YQ_VERSION=$(yq --version 2>&1 | grep -oE '[0-9]+\.[0-9]+' | head -n1 | cut -d. -f1)
 YQ_FLAGS="-i"
-if [ "$YQ_VERSION" -lt 4 ] 2>/dev/null; then
+if [ -n "$YQ_VERSION" ] && [ "$YQ_VERSION" -lt 4 ]; then
   # yq v3 requires -y flag for YAML output
   YQ_FLAGS="-y -i"
   echo "Detected yq v3, using legacy flags"
@@ -257,11 +320,24 @@ if [ -f "$PID_FILE" ]; then
     if [ "$AUTO_RESTART" = true ]; then
       echo "Automatically stopping and restarting..."
       echo "Stopping platform (PID: $OLD_PID)..."
-      kill "$OLD_PID" 2>/dev/null || true; pkill -P "$OLD_PID" 2>/dev/null || true
-      sleep 2
+      
+      # Gracefully kill the main process first
+      kill "$OLD_PID" 2>/dev/null || true
+      pkill -P "$OLD_PID" 2>/dev/null || true
+      sleep 1
+      
       # Force kill if still running
-      kill -9 "$OLD_PID" 2>/dev/null || true; pkill -9 -P "$OLD_PID" 2>/dev/null || true
+      kill -9 "$OLD_PID" 2>/dev/null || true
+      pkill -9 -P "$OLD_PID" 2>/dev/null || true
       rm -f "$PID_FILE"
+      
+      # Ensure port 8080 is cleaned up
+      echo "Cleaning up port $PLATFORM_PORT..."
+      kill_port $PLATFORM_PORT
+      
+      # Additional safety: wait for port to be released
+      sleep 1
+      
       if [ -f "$LOG_FILE" ]; then
         echo "Removing old log file: $LOG_FILE"
         rm -f "$LOG_FILE"
@@ -325,11 +401,7 @@ if ! [ -d ./keys ]; then
     .github/scripts/init-temp-keys.sh
 
     # Check if ca.jks was created successfully as a file (not a directory)
-    if [ -d keys/ca.jks ]; then
-      echo "  Warning: ca.jks was created as a directory, removing and recreating..."
-      rmdir keys/ca.jks || rm -rf keys/ca.jks
-      recreate_ca_jks "keys"
-    fi
+    verify_and_fix_ca_jks "./keys"
   else
     .github/scripts/init-temp-keys.sh
   fi
@@ -386,8 +458,7 @@ if [ ! -f ./keys/ca.jks ]; then
   if [ -d ./keys/ca.jks ]; then
     echo "  ✗ ERROR: ca.jks exists as a directory instead of a file"
     echo "  This will cause Keycloak to fail. Removing and recreating..."
-    rmdir ./keys/ca.jks || rm -rf ./keys/ca.jks
-    recreate_ca_jks "keys"
+    verify_and_fix_ca_jks "./keys"
   else
     echo "  ✗ ERROR: ca.jks not found at ./keys/ca.jks"
     echo "  Please run the key initialization first"
@@ -439,7 +510,7 @@ if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
   echo "  ✗ Keycloak did not become healthy within $((MAX_RETRIES * 3)) seconds"
   echo "  Attempting to provision anyway, but this may fail..."
 else
-  echo "  Keycloak became ready after ${RETRY_COUNT} seconds"
+  echo "  Keycloak became ready after $((RETRY_COUNT * 3)) seconds"
 fi
 echo ""
 
@@ -451,6 +522,40 @@ echo ""
 echo "Provisioning fixtures..."
 go run ./service provision fixtures
 echo "✓ Fixtures provisioned"
+echo ""
+
+# Ensure port 8080 is available before starting
+echo "Ensuring port $PLATFORM_PORT is available..."
+MAX_PORT_RETRIES=10
+PORT_RETRY_COUNT=0
+while [ $PORT_RETRY_COUNT -lt $MAX_PORT_RETRIES ]; do
+  if ! lsof -ti :$PLATFORM_PORT &> /dev/null; then
+    echo "✓ Port $PLATFORM_PORT is available"
+    break
+  fi
+
+  PORT_RETRY_COUNT=$((PORT_RETRY_COUNT + 1))
+
+  if [ $PORT_RETRY_COUNT -eq 1 ]; then
+    echo "  Port $PLATFORM_PORT is still in use, waiting for it to be released..."
+    # One more aggressive attempt to clean it up
+    kill_port $PLATFORM_PORT
+  fi
+
+  if [ $PORT_RETRY_COUNT -lt $MAX_PORT_RETRIES ]; then
+    sleep 1
+  fi
+done
+
+if [ $PORT_RETRY_COUNT -eq $MAX_PORT_RETRIES ]; then
+  echo "  ✗ ERROR: Port $PLATFORM_PORT did not become available after $MAX_PORT_RETRIES seconds"
+  echo "  Processes still using port $PLATFORM_PORT:"
+  lsof -i :$PLATFORM_PORT || true
+  echo ""
+  echo "  To manually clean up, run:"
+  echo "    lsof -ti :$PLATFORM_PORT | xargs kill -9"
+  exit 1
+fi
 echo ""
 
 # Start the platform in the background
