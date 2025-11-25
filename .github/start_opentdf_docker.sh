@@ -39,6 +39,53 @@ TEMP_DIR="${TMPDIR:-/tmp}"
 PID_FILE="${TEMP_DIR}/opentdf_platform.pid"
 LOG_FILE="${TEMP_DIR}/opentdf_platform.log"
 
+# Function to recreate ca.jks from ca.p12 using the appropriate container runtime
+recreate_ca_jks() {
+  local keys_dir="${1:-.}"
+  echo "  Converting ca.p12 to ca.jks..."
+  
+  # Set up Java environment options for ARM64 Macs
+  local JAVA_ENV_OPTS=""
+  if [ -n "${JAVA_OPTS_APPEND:-}" ]; then
+    JAVA_ENV_OPTS="-e JAVA_TOOL_OPTIONS=$JAVA_OPTS_APPEND"
+  elif [ "$(uname -m)" = "arm64" ] && sysctl -n machdep.cpu.brand_string 2>/dev/null | grep -q "Apple"; then
+    JAVA_ENV_OPTS="-e JAVA_TOOL_OPTIONS=-XX:UseSVE=0"
+  fi
+
+  # Use the appropriate container runtime and volume mount flags
+  if [ "$CONTAINER_RUNTIME" = "podman" ]; then
+    podman run --rm \
+      $JAVA_ENV_OPTS \
+      -v "$(cd "$keys_dir" && pwd):/keys:Z" \
+      --entrypoint keytool \
+      keycloak/keycloak:25.0 \
+      -importkeystore \
+      -srckeystore /keys/ca.p12 \
+      -srcstoretype PKCS12 \
+      -destkeystore /keys/ca.jks \
+      -deststoretype JKS \
+      -srcstorepass "password" \
+      -deststorepass "password" \
+      -noprompt
+  else
+    docker run --rm \
+      $JAVA_ENV_OPTS \
+      -v "$(cd "$keys_dir" && pwd):/keys" \
+      --entrypoint keytool \
+      keycloak/keycloak:25.0 \
+      -importkeystore \
+      -srckeystore /keys/ca.p12 \
+      -srcstoretype PKCS12 \
+      -destkeystore /keys/ca.jks \
+      -deststoretype JKS \
+      -srcstorepass "password" \
+      -deststorepass "password" \
+      -noprompt
+  fi
+  
+  echo "  ✓ ca.jks created successfully"
+}
+
 # Handle --stop flag
 if [ "$STOP_ONLY" = true ]; then
   echo "Stopping OpenTDF platform..."
@@ -291,31 +338,7 @@ if ! [ -d ./keys ]; then
     if [ -d keys/ca.jks ]; then
       echo "  Warning: ca.jks was created as a directory, removing and recreating..."
       rmdir keys/ca.jks || rm -rf keys/ca.jks
-
-      # Recreate ca.jks using podman directly with proper volume mount flags
-      echo "  Converting ca.p12 to ca.jks using podman..."
-      JAVA_ENV_OPTS=""
-      if [ -n "$JAVA_OPTS_APPEND" ]; then
-        JAVA_ENV_OPTS="-e JAVA_TOOL_OPTIONS=$JAVA_OPTS_APPEND"
-      elif [ "$(uname -m)" = "arm64" ] && sysctl -n machdep.cpu.brand_string 2>/dev/null | grep -q "Apple"; then
-        JAVA_ENV_OPTS="-e JAVA_TOOL_OPTIONS=-XX:UseSVE=0"
-      fi
-
-      podman run --rm \
-        $JAVA_ENV_OPTS \
-        -v "$(pwd)/keys:/keys:Z" \
-        --entrypoint keytool \
-        keycloak/keycloak:25.0 \
-        -importkeystore \
-        -srckeystore /keys/ca.p12 \
-        -srcstoretype PKCS12 \
-        -destkeystore /keys/ca.jks \
-        -deststoretype JKS \
-        -srcstorepass "password" \
-        -deststorepass "password" \
-        -noprompt
-
-      echo "  ✓ ca.jks created successfully"
+      recreate_ca_jks "keys"
     fi
   else
     .github/scripts/init-temp-keys.sh
@@ -374,45 +397,7 @@ if [ ! -f ./keys/ca.jks ]; then
     echo "  ✗ ERROR: ca.jks exists as a directory instead of a file"
     echo "  This will cause Keycloak to fail. Removing and recreating..."
     rmdir ./keys/ca.jks || rm -rf ./keys/ca.jks
-
-    # Recreate ca.jks using the appropriate container runtime
-    echo "  Converting ca.p12 to ca.jks..."
-    JAVA_ENV_OPTS=""
-    if [ -n "$JAVA_OPTS_APPEND" ]; then
-      JAVA_ENV_OPTS="-e JAVA_TOOL_OPTIONS=$JAVA_OPTS_APPEND"
-    elif [ "$(uname -m)" = "arm64" ] && sysctl -n machdep.cpu.brand_string 2>/dev/null | grep -q "Apple"; then
-      JAVA_ENV_OPTS="-e JAVA_TOOL_OPTIONS=-XX:UseSVE=0"
-    fi
-
-    if [ "$CONTAINER_RUNTIME" = "podman" ]; then
-      podman run --rm \
-        $JAVA_ENV_OPTS \
-        -v "$(pwd)/keys:/keys:Z" \
-        --entrypoint keytool \
-        keycloak/keycloak:25.0 \
-        -importkeystore \
-        -srckeystore /keys/ca.p12 \
-        -srcstoretype PKCS12 \
-        -destkeystore /keys/ca.jks \
-        -deststoretype JKS \
-        -srcstorepass "password" \
-        -deststorepass "password" \
-        -noprompt
-    else
-      docker run --rm \
-        $JAVA_ENV_OPTS \
-        -v "$(pwd)/keys:/keys" \
-        --entrypoint keytool \
-        keycloak/keycloak:25.0 \
-        -importkeystore \
-        -srckeystore /keys/ca.p12 \
-        -srcstoretype PKCS12 \
-        -destkeystore /keys/ca.jks \
-        -deststoretype JKS \
-        -srcstorepass "password" \
-        -deststorepass "password" \
-        -noprompt
-    fi
+    recreate_ca_jks "keys"
   else
     echo "  ✗ ERROR: ca.jks not found at ./keys/ca.jks"
     echo "  Please run the key initialization first"
