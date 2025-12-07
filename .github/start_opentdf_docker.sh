@@ -193,7 +193,7 @@ if [ "$STOP_ONLY" = true ]; then
 
   # Kill any processes bound to port 8080
   echo "Checking for processes bound to port $PLATFORM_PORT..."
-  kill_port $PLATFORM_PORT
+  kill_port $PLATFORM_PORT || true
 
   # Stop the platform service if running
   if [ -f "$PID_FILE" ]; then
@@ -333,8 +333,10 @@ if [ -f "$PID_FILE" ]; then
       
       # Ensure port 8080 is cleaned up
       echo "Cleaning up port $PLATFORM_PORT..."
-      kill_port $PLATFORM_PORT
-      
+      if ! kill_port $PLATFORM_PORT; then
+        echo "  Warning: Failed to clean up port $PLATFORM_PORT, but continuing..."
+      fi
+
       # Additional safety: wait for port to be released
       sleep 1
       
@@ -539,7 +541,7 @@ while [ $PORT_RETRY_COUNT -lt $MAX_PORT_RETRIES ]; do
   if [ $PORT_RETRY_COUNT -eq 1 ]; then
     echo "  Port $PLATFORM_PORT is still in use, waiting for it to be released..."
     # One more aggressive attempt to clean it up
-    kill_port $PLATFORM_PORT
+    kill_port $PLATFORM_PORT || echo "  Warning: Could not kill process on port $PLATFORM_PORT"
   fi
 
   if [ $PORT_RETRY_COUNT -lt $MAX_PORT_RETRIES ]; then
